@@ -1,4 +1,4 @@
-from predict import predict_emotions
+from src.predict import predict_emotions
 
 test_movies = [
 
