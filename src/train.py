@@ -1,241 +1,118 @@
-
-import pandas as pd
-import numpy as np
-import re
-import os
+import json
 import joblib
+import numpy as np
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.multiclass import OneVsRestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import f1_score, classification_report
-
-# -----------------------------------
-# 1. Load datasets
-# -----------------------------------
-
-movies = pd.read_csv(
-    "datasets/movie_feelings_dataset.csv"
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report,
+    f1_score,
+    hamming_loss,
+    precision_score,
+    recall_score
 )
 
-synonyms = pd.read_csv(
-    "datasets/synonyms_of_feelings.csv"
+from src.config import (
+    MODEL_DIR, REPORT_DIR, MODEL_PATH, METRICS_PATH,
+    RANDOM_STATE, TEST_SIZE
 )
+from src.data_preprocessing import load_and_clean_dataset
 
-print("Movie dataset:", movies.shape)
-print("Synonyms dataset:", synonyms.shape)
 
-# -----------------------------------
-# 2. Clean movie data
-# -----------------------------------
+def main():
+    df, label_columns, vocabulary = load_and_clean_dataset()
 
-movies = movies.dropna(
-    subset=["plot", "plot_feelings"]
-).copy()
+    X = df["plot_clean"]
+    y = df[label_columns].to_numpy(dtype=int)
 
-movies["plot"] = movies["plot"].astype(str)
-
-# Convert plot feelings into lists
-movies["labels"] = movies["plot_feelings"].apply(
-    lambda x: [
-        emotion.strip().lower()
-        for emotion in str(x).split(",")
-        if emotion.strip()
-    ]
-)
-
-# Remove rows without valid labels
-movies = movies[
-    movies["labels"].apply(len) > 0
-].copy()
-
-print("Valid training records:", len(movies))
-
-# -----------------------------------
-# 3. Build synonym dictionary
-# -----------------------------------
-
-synonym_map = {}
-
-for emotion in synonyms.columns:
-
-    emotion_name = emotion.lower().strip()
-
-    for word in synonyms[emotion].dropna():
-
-        word = str(word).lower().strip()
-
-        if word:
-            synonym_map.setdefault(word, set()).add(
-                emotion_name
-            )
-
-print("Synonym words:", len(synonym_map))
-
-# -----------------------------------
-# 4. Synonym-aware text preprocessing
-# -----------------------------------
-
-def process_text(text):
-
-    text = str(text).lower()
-
-    words = re.findall(r"\b[a-z]+\b", text)
-
-    detected_emotions = set()
-
-    for word in words:
-
-        if word in synonym_map:
-
-            detected_emotions.update(
-                synonym_map[word]
-            )
-
-    emotion_features = " ".join(
-        "emotion_" + emotion
-        for emotion in sorted(detected_emotions)
+    # A normal random split is used here. For a larger dataset,
+    # iterative multi-label stratification is a useful improvement.
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE
     )
 
-    return text + " " + emotion_features
-
-
-movies["processed_plot"] = movies["plot"].apply(
-    process_text
-)
-
-# -----------------------------------
-# 5. Convert labels into multi-label format
-# -----------------------------------
-
-mlb = MultiLabelBinarizer()
-
-y = mlb.fit_transform(movies["labels"])
-
-X = movies["processed_plot"]
-
-print("Number of emotion classes:", len(mlb.classes_))
-
-# -----------------------------------
-# 6. Split training and testing data
-# -----------------------------------
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.20,
-    random_state=42
-)
-
-print("Training records:", len(X_train))
-print("Testing records:", len(X_test))
-
-# -----------------------------------
-# 7. Create ML pipeline
-# -----------------------------------
-
-model = Pipeline([
-
-    (
-        "tfidf",
-        TfidfVectorizer(
-            max_features=10000,
+    # TF-IDF converts plot text into weighted numerical word features.
+    # Word and bigram features capture single words and short phrases.
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(
             ngram_range=(1, 2),
-            stop_words="english",
             min_df=2,
-            sublinear_tf=True
-        )
-    ),
-
-    (
-        "classifier",
-        OneVsRestClassifier(
+            max_df=0.95,
+            sublinear_tf=True,
+            strip_accents="unicode",
+            stop_words=None,  # Keep negation words such as "not" and "never".
+            max_features=50000
+        )),
+        # One binary classifier is trained for each emotion.
+        ("classifier", OneVsRestClassifier(
             LogisticRegression(
-                max_iter=1000,
-                class_weight="balanced"
+                max_iter=2000,
+                class_weight="balanced",
+                solver="liblinear"
             )
-        )
-    )
+        ))
+    ])
 
-])
+    print("Training model...")
+    pipeline.fit(X_train, y_train)
 
-# -----------------------------------
-# 8. Train model
-# -----------------------------------
+    print("Evaluating model...")
+    predictions = pipeline.predict(X_test)
+    probabilities = pipeline.predict_proba(X_test)
 
-print("\nTraining started...")
+    metrics = {
+        "rows_total": int(len(df)),
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "number_of_labels": int(len(label_columns)),
+        "micro_f1": float(f1_score(y_test, predictions, average="micro", zero_division=0)),
+        "macro_f1": float(f1_score(y_test, predictions, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_test, predictions, average="weighted", zero_division=0)),
+        "micro_precision": float(precision_score(y_test, predictions, average="micro", zero_division=0)),
+        "micro_recall": float(recall_score(y_test, predictions, average="micro", zero_division=0)),
+        "hamming_loss": float(hamming_loss(y_test, predictions)),
+        "labels": label_columns
+    }
 
-model.fit(X_train, y_train)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-print("Training completed!")
+    # Store model, label order, threshold and synonym vocabulary together.
+    artifact = {
+        "pipeline": pipeline,
+        "labels": label_columns,
+        "threshold": 0.35,
+        "synonyms": vocabulary
+    }
+    joblib.dump(artifact, MODEL_PATH)
 
-# -----------------------------------
-# 9. Evaluate model
-# -----------------------------------
+    with open(METRICS_PATH, "w", encoding="utf-8") as file:
+        json.dump(metrics, file, indent=4)
 
-probabilities = model.predict_proba(X_test)
-
-# Select top 3 emotions
-top3_predictions = np.zeros_like(y_test)
-
-top3_indices = np.argsort(
-    probabilities,
-    axis=1
-)[:, -3:]
-
-for i, indices in enumerate(top3_indices):
-    top3_predictions[i, indices] = 1
-
-print("\nMODEL EVALUATION")
-
-print(
-    "Micro F1:",
-    f1_score(
-        y_test,
-        top3_predictions,
-        average="micro",
+    # Per-label report helps identify emotions with weak performance.
+    report = classification_report(
+        y_test, predictions,
+        target_names=label_columns,
+        output_dict=True,
         zero_division=0
     )
-)
-
-print(
-    "Macro F1:",
-    f1_score(
-        y_test,
-        top3_predictions,
-        average="macro",
-        zero_division=0
+    import pandas as pd
+    pd.DataFrame(report).transpose().to_csv(
+        REPORT_DIR / "classification_report.csv"
     )
-)
 
-print("\nClassification Report:")
+    print("\nTraining completed.")
+    print(f"Model saved to: {MODEL_PATH}")
+    print(f"Evaluation saved to: {METRICS_PATH}")
+    print("\nMain metrics:")
+    for key in ["micro_f1", "macro_f1", "weighted_f1", "micro_precision", "micro_recall", "hamming_loss"]:
+        print(f"{key}: {metrics[key]:.4f}")
 
-print(
-    classification_report(
-        y_test,
-        top3_predictions,
-        target_names=mlb.classes_,
-        zero_division=0
-    )
-)
 
-# -----------------------------------
-# 10. Save trained model
-# -----------------------------------
-
-os.makedirs("models", exist_ok=True)
-
-joblib.dump(
-    {
-        "model": model,
-        "classes": mlb.classes_,
-        "synonym_map": synonym_map
-    },
-    "models/movie_emotion_model.pkl"
-)
-
-print("\nModel saved successfully!")
-print("Location: models/movie_emotion_model.pkl")
+if __name__ == "__main__":
+    main()
